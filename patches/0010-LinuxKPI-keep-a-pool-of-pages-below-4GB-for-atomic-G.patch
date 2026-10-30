@@ -1,0 +1,165 @@
+From 5e7dc172cf085fb0a0f5f04937ad5087b8700d24 Mon Sep 17 00:00:00 2001
+From: Brandon Thompson <brandon.joseph.thompson@gmail.com>
+Date: Thu, 29 Oct 2026 19:58:08 -0700
+Subject: [PATCH] LinuxKPI: keep a pool of pages below 4GB for atomic GFP_DMA32
+ allocations
+
+mt76 refills its RX rings with GFP_ATOMIC | GFP_DMA32 pages.  Each one
+was a vm_phys_alloc_contig() search for a page below 4GB under the free
+queue lock; with most memory above 4GB that took a whole CPU at a few
+MB/s, in the NAPI task at network priority, and stalled every other
+CPU allocating memory: the desktop stuttered during downloads.
+
+Reserve one contiguous range below 4GB at boot
+(compat.linuxkpi.dma32_page_pool, 4096 pages, only on machines with
+memory above 4GB).  Order-0 GFP_DMA32 allocations that cannot sleep
+take a page from it, and a page from that range goes back to it when
+its last reference is dropped.  Sleeping allocations are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linuxkpi/common/src/linux_page.c | 103 +++++++++++++++++++-
+ 1 file changed, 101 insertions(+), 2 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/src/linux_page.c b/sys/compat/linuxkpi/common/src/linux_page.c
+index d8b65a12d..3b0911c9a 100644
+--- a/sys/compat/linuxkpi/common/src/linux_page.c
++++ b/sys/compat/linuxkpi/common/src/linux_page.c
+@@ -49,6 +49,7 @@
+ #include <vm/vm_page.h>
+ #include <vm/vm_pageout.h>
+ #include <vm/vm_pager.h>
++#include <vm/vm_phys.h>
+ #include <vm/vm_radix.h>
+ #include <vm/vm_reserv.h>
+ #include <vm/vm_extern.h>
+@@ -95,6 +96,92 @@ linux_page_address(const struct page *page)
+ 	    IDX_TO_OFF(page->pindex)));
+ }
+ 
++/*
++ * Pool of single pages below 4GB for atomic GFP_DMA32 allocations, i.e.
++ * network drivers refilling RX rings from their interrupt task.  Without
++ * it every such page is a vm_phys_alloc_contig() search under the free
++ * queue lock which, with most memory above 4GB, costs a whole CPU at a
++ * few MB/s and stalls everyone else allocating memory.
++ *
++ * The pool is one contiguous range allocated at boot, so a page being
++ * freed is recognized by its address and goes back to the pool.
++ */
++static int lkpi_dma32_pool_size = 4096;
++SYSCTL_INT(_compat_linuxkpi, OID_AUTO, dma32_page_pool, CTLFLAG_RDTUN,
++    &lkpi_dma32_pool_size, 0, "Pages kept below 4GB for atomic GFP_DMA32 "
++    "allocations (0 disables)");
++
++static struct mtx lkpi_dma32_mtx;
++static vm_page_t lkpi_dma32_base;
++static vm_page_t *lkpi_dma32_free;
++static u_long lkpi_dma32_npages;
++static u_long lkpi_dma32_nfree;
++
++static inline bool
++lkpi_dma32_pool_page(vm_page_t m)
++{
++
++	return (lkpi_dma32_npages != 0 && m >= lkpi_dma32_base &&
++	    m < lkpi_dma32_base + lkpi_dma32_npages);
++}
++
++static vm_page_t
++lkpi_dma32_pool_get(void)
++{
++	vm_page_t m;
++
++	m = NULL;
++	mtx_lock(&lkpi_dma32_mtx);
++	if (lkpi_dma32_nfree > 0)
++		m = lkpi_dma32_free[--lkpi_dma32_nfree];
++	mtx_unlock(&lkpi_dma32_mtx);
++	return (m);
++}
++
++static void
++lkpi_dma32_pool_put(vm_page_t m)
++{
++
++	/* Undo a driver's set_pages_wc() and the like. */
++	if (pmap_page_get_memattr(m) != VM_MEMATTR_DEFAULT)
++		pmap_page_set_memattr(m, VM_MEMATTR_DEFAULT);
++	mtx_lock(&lkpi_dma32_mtx);
++	KASSERT(lkpi_dma32_nfree < lkpi_dma32_npages,
++	    ("%s: pool overflow, page %p", __func__, m));
++	lkpi_dma32_free[lkpi_dma32_nfree++] = m;
++	mtx_unlock(&lkpi_dma32_mtx);
++}
++
++static void
++lkpi_dma32_pool_init(void)
++{
++	vm_page_t m;
++	u_long i, npages;
++
++	mtx_init(&lkpi_dma32_mtx, "lkpi dma32 pages", NULL, MTX_DEF);
++	if (lkpi_dma32_pool_size <= 0 || vm_phys_nsegs == 0 ||
++	    vm_phys_segs[vm_phys_nsegs - 1].end <=
++	    (vm_paddr_t)BUS_SPACE_MAXADDR_32BIT + 1)
++		return;
++
++	npages = lkpi_dma32_pool_size;
++	m = vm_page_alloc_noobj_contig(VM_ALLOC_WIRED | VM_ALLOC_NOWAIT,
++	    npages, 0, BUS_SPACE_MAXADDR_32BIT, PAGE_SIZE, 0,
++	    VM_MEMATTR_DEFAULT);
++	if (m == NULL) {
++		printf("linuxkpi: could not reserve %lu pages below 4GB\n",
++		    npages);
++		return;
++	}
++	lkpi_dma32_free = malloc(npages * sizeof(*lkpi_dma32_free), M_DEVBUF,
++	    M_WAITOK);
++	for (i = 0; i < npages; i++)
++		lkpi_dma32_free[i] = m + i;
++	lkpi_dma32_nfree = npages;
++	lkpi_dma32_base = m;
++	lkpi_dma32_npages = npages;
++}
++
+ struct page *
+ linux_alloc_pages(gfp_t flags, unsigned int order)
+ {
+@@ -107,7 +194,12 @@ linux_alloc_pages(gfp_t flags, unsigned int order)
+ 		if ((flags & M_ZERO) != 0)
+ 			req |= VM_ALLOC_ZERO;
+ 
+-		if (order == 0 && (flags & GFP_DMA32) == 0) {
++		if (order == 0 && (flags & GFP_DMA32) != 0 &&
++		    (flags & M_WAITOK) == 0 &&
++		    (page = lkpi_dma32_pool_get()) != NULL) {
++			if ((flags & M_ZERO) != 0)
++				pmap_zero_page(page);
++		} else if (order == 0 && (flags & GFP_DMA32) == 0) {
+ 			page = vm_page_alloc_noobj(req);
+ 			if (page == NULL)
+ 				return (NULL);
+@@ -191,7 +283,13 @@ linux_free_pages(struct page *page, unsigned int order)
+ 			 * That's why we need to check if the page is managed
+ 			 * or not here.
+ 			 */
+-			if ((pgo->oflags & VPO_UNMANAGED) == 0) {
++			if (lkpi_dma32_pool_page(pgo)) {
++				/* Last reference: back to the pool, still wired. */
++				if (VPRC_WIRE_COUNT(pgo->ref_count) == 1)
++					lkpi_dma32_pool_put(pgo);
++				else
++					vm_page_unwire_noq(pgo);
++			} else if ((pgo->oflags & VPO_UNMANAGED) == 0) {
+ 				vm_page_unwire(pgo, PQ_ACTIVE);
+ 			} else {
+ 				if (vm_page_unwire_noq(pgo))
+@@ -765,6 +863,7 @@ lkpi_page_init(void *arg)
+ 	mtx_init(&vmmaplock, "IO Map lock", NULL, MTX_DEF);
+ 	for (i = 0; i < VMMAP_HASH_SIZE; i++)
+ 		LIST_INIT(&vmmaphead[i]);
++	lkpi_dma32_pool_init();
+ }
+ SYSINIT(lkpi_page, SI_SUB_DRIVERS, SI_ORDER_SECOND, lkpi_page_init, NULL);
+ 

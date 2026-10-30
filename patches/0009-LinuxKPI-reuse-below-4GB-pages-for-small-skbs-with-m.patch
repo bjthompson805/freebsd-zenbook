@@ -1,0 +1,179 @@
+From f4893af0f84182505907eb633c9e0b397c06343e Mon Sep 17 00:00:00 2001
+From: Brandon Thompson <brandon.joseph.thompson@gmail.com>
+Date: Thu, 29 Oct 2026 19:58:07 -0700
+Subject: [PATCH] LinuxKPI: reuse below-4GB pages for small skbs with mem_limit
+ set
+
+With compat.linuxkpi.skb.mem_limit set, every skb's data was its own
+contigmalloc(M_NOWAIT) below the limit, even a 102 byte ACK.  Once the
+page cache filled low memory those failed and lkpi_80211_txq_tx_one()
+dropped the frame (thousands per large download, TCP stalling on
+retransmit timeouts), and every free unmapped the page with a TLB
+shootdown under the VM free queue lock.
+
+Take data of up to a page from a UMA zone of pages below the limit
+instead.  It is filled at boot (compat.linuxkpi.skb.dma32_prealloc,
+1024 pages) and never returns pages, so freed buffers are reused.
+Larger buffers, as for firmware download, still use contigmalloc.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../linuxkpi/common/include/linux/skbuff.h    |  1 +
+ sys/compat/linuxkpi/common/src/linux_skbuff.c | 92 +++++++++++++++----
+ 2 files changed, 77 insertions(+), 16 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/skbuff.h b/sys/compat/linuxkpi/common/include/linux/skbuff.h
+index 5b2c30a25..7ba3f1d13 100644
+--- a/sys/compat/linuxkpi/common/include/linux/skbuff.h
++++ b/sys/compat/linuxkpi/common/include/linux/skbuff.h
+@@ -182,6 +182,7 @@ struct sk_buff {
+ 	uint16_t		qmap;		/* queue mapping */
+ 	uint16_t		_flags;		/* Internal flags. */
+ #define	_SKB_FLAGS_SKBEXTFRAG	0x0001
++#define	_SKB_FLAGS_DMA32ZONE	0x0002
+ 	uint16_t		l3hdroff;	/* network header offset from *head */
+ 	uint16_t		l4hdroff;	/* transport header offset from *head */
+ 	uint16_t		mac_header;	/* offset of mac_header */
+diff --git a/sys/compat/linuxkpi/common/src/linux_skbuff.c b/sys/compat/linuxkpi/common/src/linux_skbuff.c
+index abfb642ba..ffd04444e 100644
+--- a/sys/compat/linuxkpi/common/src/linux_skbuff.c
++++ b/sys/compat/linuxkpi/common/src/linux_skbuff.c
+@@ -38,10 +38,13 @@
+ 
+ #include <sys/param.h>
+ #include <sys/types.h>
++#include <sys/domainset.h>
+ #include <sys/kernel.h>
+ #include <sys/malloc.h>
+ #include <sys/sysctl.h>
+ 
++#include <vm/vm.h>
++#include <vm/vm_extern.h>
+ #include <vm/uma.h>
+ 
+ #ifdef DDB
+@@ -86,6 +89,51 @@ SYSCTL_INT(_compat_linuxkpi_skb, OID_AUTO, mem_limit, CTLFLAG_RDTUN,
+     "1=32bit, 2=36bit, other=undef (currently 32bit)");
+ 
+ static MALLOC_DEFINE(M_LKPISKB, "lkpiskb", "Linux KPI skbuff compat");
++
++/*
++ * Buffers of up to a page come from a zone of pages below the limit.  The
++ * zone is filled at boot and never gives pages back, so freed buffers are
++ * reused.  A contigmalloc(M_NOWAIT) per packet fails once the page cache
++ * (e.g. the ZFS ARC) has taken all the low memory, and TX drops the frame.
++ */
++static uma_zone_t skbdma32zone;
++static int linuxkpi_skb_dma32_prealloc = 1024;
++SYSCTL_INT(_compat_linuxkpi_skb, OID_AUTO, dma32_prealloc, CTLFLAG_RDTUN,
++    &linuxkpi_skb_dma32_prealloc, 0, "Pages preallocated for SKB data "
++    "when mem_limit is set");
++
++static vm_paddr_t
++lkpi_skb_memlimit_high(void)
++{
++
++	switch (linuxkpi_skb_memlimit) {
++#ifdef __LP64__
++	case 2:
++		return (0xfffffffff);	/* 1<<36 really. */
++#endif
++	case 1:
++	default:
++		return (0xffffffff);	/* 1<<32 really. */
++	}
++}
++
++static void *
++lkpi_skb_dma32_alloc(uma_zone_t zone __unused, vm_size_t bytes, int domain,
++    uint8_t *pflag, int wait)
++{
++
++	*pflag = UMA_SLAB_KERNEL;
++	return (kmem_alloc_contig_domainset(DOMAINSET_FIXED(domain), bytes,
++	    wait, 0, lkpi_skb_memlimit_high(), PAGE_SIZE, 0,
++	    VM_MEMATTR_DEFAULT));
++}
++
++static void
++lkpi_skb_dma32_free(void *item, vm_size_t bytes, uint8_t pflag __unused)
++{
++
++	kmem_free(item, bytes);
++}
+ #endif
+ 
+ struct sk_buff *
+@@ -113,22 +161,17 @@ linuxkpi_alloc_skb(size_t size, gfp_t gfp)
+ 	 * We assume no one calls kfree directly on the skb.
+ 	 */
+ 	if (__predict_false(linuxkpi_skb_memlimit != 0)) {
+-		vm_paddr_t high;
+-
+-		switch (linuxkpi_skb_memlimit) {
+-#ifdef __LP64__
+-		case 2:
+-			high = (0xfffffffff);	/* 1<<36 really. */
+-			break;
+-#endif
+-		case 1:
+-		default:
+-			high = (0xffffffff);	/* 1<<32 really. */
+-			break;
+-		}
+ 		len = roundup_pow_of_two(len);
+-		p = contigmalloc(len, M_LKPISKB,
+-		    linux_check_m_flags(gfp) | M_ZERO, 0, high, PAGE_SIZE, 0);
++		if (len <= PAGE_SIZE) {
++			p = uma_zalloc(skbdma32zone, linux_check_m_flags(gfp));
++			if (p != NULL) {
++				memset(p, 0, len);
++				skb->_flags |= _SKB_FLAGS_DMA32ZONE;
++			}
++		} else
++			p = contigmalloc(len, M_LKPISKB,
++			    linux_check_m_flags(gfp) | M_ZERO, 0,
++			    lkpi_skb_memlimit_high(), PAGE_SIZE, 0);
+ 	} else
+ #endif
+ 	p = __kmalloc(len, linux_check_m_flags(gfp) | M_ZERO);
+@@ -276,7 +319,9 @@ linuxkpi_kfree_skb(struct sk_buff *skb)
+ 	}
+ 
+ #ifdef	SKB_DMA32_MALLOC
+-	if (__predict_false(linuxkpi_skb_memlimit != 0))
++	if ((skb->_flags & _SKB_FLAGS_DMA32ZONE) != 0)
++		uma_zfree(skbdma32zone, skb->head);
++	else if (__predict_false(linuxkpi_skb_memlimit != 0))
+ 		free(skb->head, M_LKPISKB);
+ 	else
+ #endif
+@@ -291,6 +336,17 @@ lkpi_skbuff_init(void *arg __unused)
+ 	    sizeof(struct sk_buff) + sizeof(struct skb_shared_info),
+ 	    NULL, NULL, NULL, NULL, UMA_ALIGN_PTR, 0);
+ 	/* Do we need to apply limits? */
++#ifdef	SKB_DMA32_MALLOC
++	if (linuxkpi_skb_memlimit != 0) {
++		skbdma32zone = uma_zcreate("skbuff_dma32", PAGE_SIZE,
++		    NULL, NULL, NULL, NULL, UMA_ALIGN_PTR, UMA_ZONE_NOFREE);
++		uma_zone_set_allocf(skbdma32zone, lkpi_skb_dma32_alloc);
++		uma_zone_set_freef(skbdma32zone, lkpi_skb_dma32_free);
++		if (linuxkpi_skb_dma32_prealloc > 0)
++			uma_prealloc(skbdma32zone,
++			    linuxkpi_skb_dma32_prealloc);
++	}
++#endif
+ }
+ SYSINIT(linuxkpi_skbuff, SI_SUB_DRIVERS, SI_ORDER_FIRST, lkpi_skbuff_init, NULL);
+ 
+@@ -298,6 +354,10 @@ static void
+ lkpi_skbuff_destroy(void *arg __unused)
+ {
+ 	uma_zdestroy(skbzone);
++#ifdef	SKB_DMA32_MALLOC
++	if (skbdma32zone != NULL)
++		uma_zdestroy(skbdma32zone);
++#endif
+ }
+ SYSUNINIT(linuxkpi_skbuff, SI_SUB_DRIVERS, SI_ORDER_SECOND, lkpi_skbuff_destroy, NULL);
+ 

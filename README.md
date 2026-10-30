@@ -11,7 +11,7 @@ unattached:
 
     none1@pci0:195:0:0: class=0x028000 vendor=0x14c3 device=0x7925
 
-These eight patches against `releng/15.1` fill those gaps. With them the
+These ten patches against `releng/15.1` fill those gaps. With them the
 chip loads its firmware, scans, joins WPA2 networks and passes traffic.
 
 ## Status
@@ -22,7 +22,9 @@ chip loads its firmware, scans, joins WPA2 networks and passes traffic.
 
 Tested on FreeBSD 15.1, as a station on a 5 GHz WPA2 network (802.11ac,
 80 MHz): DHCP, 6 ms pings to the access point, no loss. Loading, unloading,
-and failed or lost connections no longer panic.
+and failed or lost connections no longer panic. A sustained multi-GB
+download over a phone hotspot runs at 4–5 MB/s with no loss, the NAPI
+task at about 10% of one CPU.
 
 Not tested: 2.4 GHz and 6 GHz (no network was in range), suspend and
 resume, access point and monitor modes, WPA3-only networks. Other mt76
@@ -41,6 +43,8 @@ the LinuxKPI fixes, but are untested. Please report back.
 | 6 | A destroyed idr locked a destroyed mutex. mt7925 cleans a station up twice, so a failed connection panicked. |
 | 7 | Adds the `compat.linuxkpi.mt7925_pci_runtime_pm` tunable (see below). |
 | 8 | `idr_remove()` of an unused id panicked; Linux returns NULL, and mt76's TX status check relies on it. |
+| 9 | With `skb.mem_limit` set, every skb was its own `contigmalloc(M_NOWAIT)` below 4 GB. Once the page cache filled low memory those failed and TX frames were dropped (TCP stalled), and every free cost a TLB shootdown. Small skbs now come from a preallocated zone of low pages that is reused. |
+| 10 | mt76 refills RX with `GFP_ATOMIC \| GFP_DMA32` pages; each was a search for a page below 4 GB under the VM free queue lock. During downloads the NAPI task used a whole CPU and the desktop stuttered. A pool of pages below 4 GB reserved at boot now serves them and takes them back. |
 
 2 and 3 are fixed in FreeBSD main in the same way.
 
@@ -95,6 +99,17 @@ from the boot menu's kernel option to get the stock one back.
   can switch it at runtime in debugfs, but doing that on a live connection
   drops the link under LinuxKPI.
 
+Two more tunables size the low-memory pools from patches 9 and 10. The
+defaults are fine; they are listed in case `dmesg` reports that a pool
+could not be reserved.
+
+- `compat.linuxkpi.skb.dma32_prealloc` (default `1024` pages, 4 MB):
+  skb data pages preallocated below 4 GB when `skb.mem_limit` is set. The
+  zone grows past this if needed and keeps what it grows.
+- `compat.linuxkpi.dma32_page_pool` (default `4096` pages, 16 MB): pages
+  below 4 GB reserved at boot for RX buffers. Only used on machines with
+  memory above 4 GB; `0` disables it.
+
 ## Updates
 
 - `pkg upgrade` leaves `/boot/mt7925` and `/boot/modules` alone, so this
@@ -111,9 +126,9 @@ from the boot menu's kernel option to get the stock one back.
   `dmesg`). A reboot is not enough; power the machine off completely.
 - net80211 sometimes asks for an AUTH to AUTH transition, which LinuxKPI
   does not support (`error 95`); the attempt is dropped and retried.
-- The page pool does not recycle pages, and only works with 1:1 DMA
-  mappings (no IOMMU, the FreeBSD default). Allocation fails with a warning
-  otherwise.
+- The page pool only works with 1:1 DMA mappings (no IOMMU, the FreeBSD
+  default). Allocation fails with a warning otherwise. It does not recycle
+  pages itself; the below-4 GB pool from patch 10 does.
 
 ## License
 
