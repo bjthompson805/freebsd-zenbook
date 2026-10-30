@@ -1,4 +1,4 @@
-# Build FreeBSD's own mt76/mt7925 driver with the patches it needs.
+# Build a FreeBSD 15.1 kernel and the mt76/mt7925 modules with these patches.
 #
 # SRC is a releng/15.1 source tree; OBJ is where kernel and module objects go.
 # The patches touch LinuxKPI code that is compiled into the kernel, so both a
@@ -6,9 +6,9 @@
 # one (/boot/${INSTKERNNAME}), which keeps pkgbase's /boot/kernel untouched.
 
 SRC?=		/usr/src
-OBJ?=		/usr/obj/mt7925
+OBJ?=		/usr/obj/zenbook
 KERNCONF?=	GENERIC
-INSTKERNNAME?=	mt7925
+INSTKERNNAME?=	zenbook
 MODDIR?=	/boot/modules
 JOBS!=		sysctl -n hw.ncpu
 

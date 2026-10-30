@@ -1,6 +1,10 @@
-# mt7925
+# freebsd-zenbook
 
-Native Wi-Fi for the MediaTek MT7925 on FreeBSD.
+FreeBSD 15.1 kernel patches for the ASUS Zenbook S 16 (UM5606WA, Ryzen AI
+9 365): native Wi-Fi for its MediaTek MT7925 (patches 1–10), and lower idle
+power from AMD CPPC and NVMe APST (patches 11–12).
+
+## Wi-Fi
 
 FreeBSD 15.1 already contains the Linux `mt76` driver, `mt7925` included,
 under `sys/contrib/dev/mediatek/mt76`. It is compiled through LinuxKPI,
@@ -11,10 +15,10 @@ unattached:
 
     none1@pci0:195:0:0: class=0x028000 vendor=0x14c3 device=0x7925
 
-These ten patches against `releng/15.1` fill those gaps. With them the
-chip loads its firmware, scans, joins WPA2 networks and passes traffic.
+Patches 1–10 against `releng/15.1` fill those gaps. With them the chip
+loads its firmware, scans, joins WPA2 networks and passes traffic.
 
-## Status
+### Status
 
 | Chip   | PCI ID      | Machine                      | State    |
 |--------|-------------|------------------------------|----------|
@@ -31,6 +35,26 @@ resume, access point and monitor modes, WPA3-only networks. Other mt76
 chips (MT7921, MT7922) share most of this code and probably benefit from
 the LinuxKPI fixes, but are untested. Please report back.
 
+## Power
+
+On 15.1 the AMD CPU driver, hwpstate_amd(4), only knows three legacy
+P-states and cannot use CPPC, and nvme(4) never enables APST, so the SSD
+stays in its full-power state while idle. Patch 11 brings in FreeBSD
+main's hwpstate_amd(4), which runs the cores through CPPC with an
+energy/performance preference (EPP); patch 12 has nvme(4) enable APST the
+way Linux does. Idle on battery, brightness 72, 120 Hz, Wi-Fi up:
+
+| Setup                                                | Idle draw |
+|------------------------------------------------------|-----------|
+| Stock 15.1, powerd at minimum                        | 11.9 W    |
+| Patch 11, CPPC at its defaults                       | 18–21 W   |
+| Patch 11, hardware-chosen clocks, EPP 192            | 10.6 W    |
+| Patches 11 and 12, Bluetooth `usb_isoc_enable=0`     | ~10.5 W   |
+
+CPPC's defaults pin every core at full speed; see [The power
+settings](#the-power-settings). Verified on the Zenbook's Ryzen AI 9 365
+(Zen 5) and its Micron 2400 SSD (`1344:5413`).
+
 ## The patches
 
 | # | Fixes |
@@ -46,14 +70,20 @@ the LinuxKPI fixes, but are untested. Please report back.
 | 9 | With `skb.mem_limit` set, every skb was its own `contigmalloc(M_NOWAIT)` below 4 GB. Once the page cache filled low memory those failed and TX frames were dropped (TCP stalled), and every free cost a TLB shootdown. Small skbs now come from a preallocated zone of low pages that is reused. |
 | 10 | mt76 refills RX with `GFP_ATOMIC \| GFP_DMA32` pages; each was a search for a page below 4 GB under the VM free queue lock. During downloads the NAPI task used a whole CPU and the desktop stuttered. A pool of pages below 4 GB reserved at boot now serves them and takes them back. |
 
-2 and 3 are fixed in FreeBSD main in the same way.
+| 11 | hwpstate_amd(4) from FreeBSD main (as of `1a3d61552546`), which uses CPPC on Zen CPUs that have it, with per-CPU EPP and minimum/maximum/desired performance sysctls. Two helpers main grew, `cpu_get_pcpuid()` and `smp_rendezvous_cpu()`, are defined in the driver. |
+| 12 | nvme(4) never set Autonomous Power State Transition. It now builds an APST table from the drive's power states as Linux does (shallow non-operational states after 100 ms idle, deeper ones after 2 s) and sets it on every controller start. |
+
+2 and 3 are fixed in FreeBSD main in the same way, and 11 is main's own
+driver (due in 16.0). 12 is not in FreeBSD.
 
 ## Install
 
-The patches change LinuxKPI code that is compiled into the kernel, so this
-builds a kernel as well as the two modules. The kernel is installed to
-`/boot/mt7925`, beside the stock one, which keeps pkgbase's `/boot/kernel`
-untouched.
+The patches change code that is compiled into the kernel (LinuxKPI,
+hwpstate_amd, nvme), so this builds a kernel as well as the two Wi-Fi
+modules. The kernel is installed to `/boot/zenbook`, beside the stock one,
+which keeps pkgbase's `/boot/kernel` untouched. (Before the power patches
+this repo was `mt7925` and installed to `/boot/mt7925`; set
+`INSTKERNNAME=mt7925` to keep that name.)
 
 Get a `releng/15.1` source tree and patch it:
 
@@ -61,7 +91,7 @@ Get a `releng/15.1` source tree and patch it:
     make patch
 
 Build and install (`SRC` and `OBJ` default to `/usr/src` and
-`/usr/obj/mt7925`):
+`/usr/obj/zenbook`):
 
     make
     make install
@@ -72,7 +102,7 @@ Install the firmware:
 
 Add to `/boot/loader.conf`:
 
-    kernel="mt7925"
+    kernel="zenbook"
     compat.linuxkpi.skb.mem_limit="1"
     compat.linuxkpi.mt7925_pci_runtime_pm="0"
 
@@ -110,15 +140,47 @@ could not be reserved.
   below 4 GB reserved at boot for RX buffers. Only used on machines with
   memory above 4 GB; `0` disables it.
 
+### The power settings
+
+hwpstate_amd(4) attaches with every core's desired performance at its
+maximum and EPP at 0 (fastest), so nothing is slower than before, and
+powerd(8) has no effect on it. To save power, hand clock choice to the
+hardware and raise EPP, for every CPU, at each boot (an rc script works):
+
+    for n in $(jot $(sysctl -n hw.ncpu) 0); do
+        sysctl dev.hwpstate_amd.$n.desired_performance=0 \
+            dev.hwpstate_amd.$n.epp=192
+    done
+
+EPP runs from 0 (performance) to 255 (efficiency). At idle 0 drew
+11.9 W, 128 10.9 W, 192 10.6 W and 255 10.7 W, the last with the cores
+held near 2 GHz, so 192 is a good battery setting and 128 a balanced
+one. `machdep.hwpstate_amd_cppc_enable="0"` in `/boot/loader.conf` goes
+back to the legacy P-states.
+
+APST needs nothing. `hw.nvme.apst_enable="0"` turns it off, and
+`hw.nvme.apst_max_latency_us` (default `100000`) skips power states that
+take longer than that to enter and leave. To check it took, as root:
+
+    nvmecontrol admin-passthru -o 0x0a -4 0x0c -l 256 -r nvme0 | head -2
+
+`DWORD0 status= 0x1` means it is on.
+
+Not a kernel patch, but worth having: FreeBSD's Bluetooth driver keeps a
+USB adapter's SCO (headset voice) endpoint polling every millisecond,
+which here cost 1000 interrupts a second and 0.5 W. FreeBSD has no HFP to
+use it, so set `net.bluetooth.usb_isoc_enable="0"` in `/boot/loader.conf`.
+
 ## Updates
 
-- `pkg upgrade` leaves `/boot/mt7925` and `/boot/modules` alone, so this
+- `pkg upgrade` leaves `/boot/zenbook` and `/boot/modules` alone, so this
   keeps working. But a new base kernel package (a security patch such as
   15.1-p7) goes to `/boot/kernel`, which you are not booting: update the
   source tree, `make patch`, `make` and `make install` to pick it up.
 - A new release (15.2, 16.0) needs these patches checked or redone: the
   driver and LinuxKPI change between releases, and some fixes are already
-  in main. Don't move to one until this has been ported.
+  in main. Don't move to one until this has been ported. 16.0 will have
+  patch 11's driver itself.
 
 ## Known issues
 
@@ -132,8 +194,9 @@ could not be reserved.
 
 ## License
 
-The patches modify FreeBSD's LinuxKPI (BSD-2-Clause) and mt76
-(BSD-3-Clause-Clear) and are under the license of the file each changes.
+The patches modify FreeBSD's LinuxKPI, hwpstate_amd and nvme
+(BSD-2-Clause) and mt76 (BSD-3-Clause-Clear) and are under the license of
+the file each changes.
 The Makefile and this README are BSD-2-Clause, see `LICENSE`. The firmware
 belongs to MediaTek, is distributed through linux-firmware and the FreeBSD
 `wifi-firmware-mt76-kmod-mt7925` package under its own license, and is not
