@@ -1,0 +1,74 @@
+From a9ff8a3489fe0d749454ba00d00d1ccfdcbe950c Mon Sep 17 00:00:00 2001
+From: Brandon Thompson <brandon.joseph.thompson@gmail.com>
+Date: Thu, 29 Oct 2026 17:30:23 -0700
+Subject: [PATCH 7/8] mt7925: add a load-time runtime_pm tunable
+
+Runtime PM and deep sleep add 20-60ms of latency after idle.  Linux
+switches them in debugfs, which we do not build, and flipping them on
+a live connection drops it under LinuxKPI.  Add
+compat.linuxkpi.mt7925_pci_runtime_pm (default 1) to choose at load
+time, before any connection exists; 0 runs the chip awake like the
+USB variant.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/contrib/dev/mediatek/mt76/mt7925/init.c   |  4 ++++
+ sys/contrib/dev/mediatek/mt76/mt7925/mt7925.h |  3 +++
+ sys/contrib/dev/mediatek/mt76/mt7925/pci.c    | 14 ++++++++++++++
+ 3 files changed, 21 insertions(+)
+
+diff --git a/sys/contrib/dev/mediatek/mt76/mt7925/init.c b/sys/contrib/dev/mediatek/mt76/mt7925/init.c
+index 31592775f..0d5580394 100644
+--- a/sys/contrib/dev/mediatek/mt76/mt7925/init.c
++++ b/sys/contrib/dev/mediatek/mt76/mt7925/init.c
+@@ -236,7 +236,11 @@ int mt7925_register_device(struct mt792x_dev *dev)
+ 	dev->pm.idle_timeout = MT792x_PM_TIMEOUT;
+ 	dev->pm.stats.last_wake_event = jiffies;
+ 	dev->pm.stats.last_doze_event = jiffies;
++#if defined(__FreeBSD__)
++	if (!mt76_is_usb(&dev->mt76) && mt7925_runtime_pm) {
++#else
+ 	if (!mt76_is_usb(&dev->mt76)) {
++#endif
+ 		dev->pm.enable_user = true;
+ 		dev->pm.enable = true;
+ 		dev->pm.ds_enable_user = true;
+diff --git a/sys/contrib/dev/mediatek/mt76/mt7925/mt7925.h b/sys/contrib/dev/mediatek/mt76/mt7925/mt7925.h
+index 6b9bf1b89..3b72faf38 100644
+--- a/sys/contrib/dev/mediatek/mt76/mt7925/mt7925.h
++++ b/sys/contrib/dev/mediatek/mt76/mt7925/mt7925.h
+@@ -319,6 +319,9 @@ int mt7925e_mac_reset(struct mt792x_dev *dev);
+ int mt7925e_mcu_init(struct mt792x_dev *dev);
+ void mt7925_mac_add_txs(struct mt792x_dev *dev, void *data);
+ void mt7925_set_runtime_pm(struct mt792x_dev *dev);
++#if defined(__FreeBSD__)
++extern bool mt7925_runtime_pm;
++#endif
+ void mt7925_mcu_set_suspend_iter(void *priv, u8 *mac,
+ 				 struct ieee80211_vif *vif);
+ void mt7925_connac_mcu_set_suspend_iter(void *priv, u8 *mac,
+diff --git a/sys/contrib/dev/mediatek/mt76/mt7925/pci.c b/sys/contrib/dev/mediatek/mt76/mt7925/pci.c
+index d57e1aacf..7f943add4 100644
+--- a/sys/contrib/dev/mediatek/mt76/mt7925/pci.c
++++ b/sys/contrib/dev/mediatek/mt76/mt7925/pci.c
+@@ -27,6 +27,20 @@ static bool mt7925_disable_aspm;
+ module_param_named(disable_aspm, mt7925_disable_aspm, bool, 0644);
+ MODULE_PARM_DESC(disable_aspm, "disable PCI ASPM support");
+ 
++#if defined(__FreeBSD__)
++/*
++ * Runtime PM and deep sleep save power, but every packet after ~80ms idle
++ * waits for the chip to wake: 20-60ms of extra latency.  Linux switches them
++ * in debugfs, which we do not build, and switching them on a live connection
++ * drops it under LinuxKPI.  So choose at load time, before any connection:
++ * compat.linuxkpi.mt7925_pci_runtime_pm=0 in loader.conf runs the chip awake,
++ * the way the USB variant always runs.
++ */
++bool mt7925_runtime_pm = true;
++module_param_named(runtime_pm, mt7925_runtime_pm, bool, 0444);
++MODULE_PARM_DESC(runtime_pm, "let the chip sleep when idle (saves power, adds latency)");
++#endif
++
+ static int mt7925e_init_reset(struct mt792x_dev *dev)
+ {
+ 	return mt792x_wpdma_reset(dev, true);

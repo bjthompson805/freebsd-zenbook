@@ -1,0 +1,37 @@
+From 31363f7e793868e6b20c3bb78546f7b2949f54a0 Mon Sep 17 00:00:00 2001
+From: Brandon Thompson <brandon.joseph.thompson@gmail.com>
+Date: Thu, 29 Oct 2026 17:35:06 -0700
+Subject: [PATCH 8/8] LinuxKPI: idr_remove() of an unallocated id returns NULL
+
+Linux returns NULL; we panicked.  mt76's periodic TX status check
+removes packet ids that may not be in use, which panicked as soon as
+mt7925 ran with runtime PM off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linuxkpi/common/src/linux_idr.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/src/linux_idr.c b/sys/compat/linuxkpi/common/src/linux_idr.c
+index 07d99beb1..198f3ff83 100644
+--- a/sys/compat/linuxkpi/common/src/linux_idr.c
++++ b/sys/compat/linuxkpi/common/src/linux_idr.c
+@@ -263,13 +263,13 @@ idr_remove_locked(struct idr *idr, int id)
+ 	}
+ 	idx = id & IDR_MASK;
+ 	/*
+-	 * At this point we've set free space bitmaps up the whole tree.
+-	 * We could make this non-fatal and unwind but linux dumps a stack
+-	 * and a warning so I don't think it's necessary.
++	 * At this point we've set free space bitmaps up the whole tree,
++	 * which is harmless if the item turns out not to exist.  Linux
++	 * returns NULL for an id that is not allocated, and drivers rely on
++	 * it: mt76's TX status check removes packet ids that may be unused.
+ 	 */
+ 	if (il == NULL || (il->bitmap & (1 << idx)) != 0)
+-		panic("idr_remove: Item %d not allocated (%p, %p)\n",
+-		    id, idr, il);
++		return (NULL);
+ 	res = il->ary[idx];
+ 	il->ary[idx] = NULL;
+ 	il->bitmap |= 1 << idx;

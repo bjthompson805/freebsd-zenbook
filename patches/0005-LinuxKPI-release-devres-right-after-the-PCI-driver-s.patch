@@ -1,0 +1,34 @@
+From 74e86d8f14eee77d31851696c3bf2c8ec4857545 Mon Sep 17 00:00:00 2001
+From: Brandon Thompson <brandon.joseph.thompson@gmail.com>
+Date: Thu, 29 Oct 2026 16:51:32 -0700
+Subject: [PATCH 5/8] LinuxKPI: release devres right after the PCI driver's
+ remove()
+
+Managed resources were only released with the last device reference,
+after linux_pdev_dma_uninit() had freed dma_priv, so freeing
+dmam_alloc_coherent() memory on kldunload of mt7925 panicked in
+lkpi_dma_unmap().  Release them after remove(), as Linux does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linuxkpi/common/src/linux_pci.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/src/linux_pci.c b/sys/compat/linuxkpi/common/src/linux_pci.c
+index 6e887d0d2..a3b3b49a5 100644
+--- a/sys/compat/linuxkpi/common/src/linux_pci.c
++++ b/sys/compat/linuxkpi/common/src/linux_pci.c
+@@ -683,6 +683,13 @@ linux_pci_detach_device(struct pci_dev *pdev)
+ 	if (pdev->pdrv != NULL)
+ 		pdev->pdrv->remove(pdev);
+ 
++	/*
++	 * Like Linux, release managed resources once the driver is gone.
++	 * Waiting for the last reference would free dmam_alloc_coherent()
++	 * memory after linux_pdev_dma_uninit() freed the DMA state it needs.
++	 */
++	lkpi_devres_release_free_list(&pdev->dev);
++
+ 	if (pdev->root != NULL)
+ 		pci_dev_put(pdev->root);
+ 	free(pdev->bus, M_DEVBUF);

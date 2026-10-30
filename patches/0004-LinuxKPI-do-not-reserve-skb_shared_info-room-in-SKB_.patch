@@ -1,0 +1,36 @@
+From 87d533dc2acd534e3c256d7c17fbd8aa1ca984d1 Mon Sep 17 00:00:00 2001
+From: Brandon Thompson <brandon.joseph.thompson@gmail.com>
+Date: Thu, 29 Oct 2026 16:46:09 -0700
+Subject: [PATCH 4/8] LinuxKPI: do not reserve skb_shared_info room in
+ SKB_WITH_OVERHEAD()
+
+Our skb_shared_info lives next to the sk_buff, not at the end of the
+data buffer, but SKB_WITH_OVERHEAD() still subtracted it.  With 64
+frags it is 1600 bytes, leaving mt76 448 bytes of each 2048 byte RX
+buffer, so it dropped every larger frame, including beacons.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linuxkpi/common/include/linux/skbuff.h | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/skbuff.h b/sys/compat/linuxkpi/common/include/linux/skbuff.h
+index 114ec5011..5b2c30a25 100644
+--- a/sys/compat/linuxkpi/common/include/linux/skbuff.h
++++ b/sys/compat/linuxkpi/common/include/linux/skbuff.h
+@@ -1170,7 +1170,13 @@ skb_cow_head(struct sk_buff *skb, unsigned int headroom)
+ /* Misplaced here really but sock comes from skbuff. */
+ #define	sk_pacing_shift_update(sock, n)
+ 
+-#define	SKB_WITH_OVERHEAD(_s)						\
+-	(_s) - ALIGN(sizeof(struct skb_shared_info), CACHE_LINE_SIZE)
++/*
++ * Linux keeps skb_shared_info at the end of the data buffer, so a buffer of
++ * _s bytes has less room for data.  We keep it next to the sk_buff instead
++ * (see linuxkpi_alloc_skb() and linuxkpi_build_skb()), so all of it is usable.
++ * Subtracting our (much larger) shinfo left mt76 448 of 2048 bytes and it
++ * dropped every larger frame, beacons included.
++ */
++#define	SKB_WITH_OVERHEAD(_s)	((_s))
+ 
+ #endif	/* _LINUXKPI_LINUX_SKBUFF_H */

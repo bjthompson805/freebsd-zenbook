@@ -1,0 +1,87 @@
+From fa9b5561f3e5f378abeff5130b69cf229180d63d Mon Sep 17 00:00:00 2001
+From: Brandon Thompson <brandon.joseph.thompson@gmail.com>
+Date: Thu, 29 Oct 2026 17:04:15 -0700
+Subject: [PATCH 6/8] LinuxKPI: keep a destroyed idr usable as an empty one
+
+In Linux an idr is still valid and empty after idr_destroy().  Ours
+destroys the lock, and mt7925 cleans a station's wcid up twice (once
+in mt7925_mac_sta_remove_links(), once in __mt76_sta_remove()), so
+removing a station after a failed authentication panicked in
+idr_remove().  Have the locking accessors treat an idr without an
+initialized lock as empty, as idr_destroy() already does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linuxkpi/common/src/linux_idr.c | 24 ++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/sys/compat/linuxkpi/common/src/linux_idr.c b/sys/compat/linuxkpi/common/src/linux_idr.c
+index 664177835..07d99beb1 100644
+--- a/sys/compat/linuxkpi/common/src/linux_idr.c
++++ b/sys/compat/linuxkpi/common/src/linux_idr.c
+@@ -171,6 +171,20 @@ idr_init(struct idr *idr)
+ 	mtx_init(&idr->lock, "idr", NULL, MTX_DEF);
+ }
+ 
++/*
++ * In Linux an idr is still a valid, empty idr after idr_destroy(), and
++ * drivers rely on that: mt7925 cleans up a station's wcid (ending in
++ * idr_destroy()) and mt76 then cleans it up again.  Our idr_destroy()
++ * destroys the lock, so lookups and removals on such an idr (or on one
++ * that was never initialized) must not take it; it holds nothing.
++ */
++static inline bool
++idr_usable(struct idr *idr)
++{
++
++	return (mtx_initialized(&idr->lock) != 0);
++}
++
+ /* Only frees cached pages. */
+ void
+ idr_destroy(struct idr *idr)
+@@ -215,6 +229,8 @@ void
+ idr_remove_all(struct idr *idr)
+ {
+ 
++	if (!idr_usable(idr))
++		return;
+ 	mtx_lock(&idr->lock);
+ 	idr_remove_layer(idr->top, idr->layers - 1);
+ 	idr->top = NULL;
+@@ -266,6 +282,8 @@ idr_remove(struct idr *idr, int id)
+ {
+ 	void *res;
+ 
++	if (!idr_usable(idr))
++		return (NULL);
+ 	mtx_lock(&idr->lock);
+ 	res = idr_remove_locked(idr, id);
+ 	mtx_unlock(&idr->lock);
+@@ -298,6 +316,8 @@ idr_replace(struct idr *idr, void *ptr, int id)
+ 	void *res;
+ 	int idx;
+ 
++	if (!idr_usable(idr))
++		return (ERR_PTR(-ENOENT));
+ 	mtx_lock(&idr->lock);
+ 	il = idr_find_layer_locked(idr, id);
+ 	idx = id & IDR_MASK;
+@@ -333,6 +353,8 @@ idr_find(struct idr *idr, int id)
+ {
+ 	void *res;
+ 
++	if (!idr_usable(idr))
++		return (NULL);
+ 	mtx_lock(&idr->lock);
+ 	res = idr_find_locked(idr, id);
+ 	mtx_unlock(&idr->lock);
+@@ -345,6 +367,8 @@ idr_get_next(struct idr *idr, int *nextidp)
+ 	void *res = NULL;
+ 	int id = *nextidp;
+ 
++	if (!idr_usable(idr))
++		return (NULL);
+ 	mtx_lock(&idr->lock);
+ 	for (; id <= idr_max(idr); id++) {
+ 		res = idr_find_locked(idr, id);

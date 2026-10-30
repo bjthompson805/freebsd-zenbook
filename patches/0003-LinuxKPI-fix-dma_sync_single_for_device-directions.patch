@@ -1,0 +1,37 @@
+From fbe792c2cb1694fe88782c141fa7b06800d287bd Mon Sep 17 00:00:00 2001
+From: Brandon Thompson <brandon.joseph.thompson@gmail.com>
+Date: Thu, 29 Oct 2026 16:26:58 -0700
+Subject: [PATCH 3/8] LinuxKPI: fix dma_sync_single_for_device() directions
+
+DMA_TO_DEVICE synced with PREREAD and DMA_FROM_DEVICE with PREWRITE,
+so data was never copied into bounce pages before the device read
+them.  With a 32-bit DMA mask on a machine with more than 4GB, mt7925
+fetched MCU commands from empty bounce pages and never answered.
+Use the directions main uses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sys/compat/linuxkpi/common/include/linux/dma-mapping.h | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+index 5e5d40ef8..4bf0c2c54 100644
+--- a/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
++++ b/sys/compat/linuxkpi/common/include/linux/dma-mapping.h
+@@ -277,13 +277,13 @@ dma_sync_single_for_device(struct device *dev, dma_addr_t dma,
+ 
+ 	switch (direction) {
+ 	case DMA_BIDIRECTIONAL:
+-		op = BUS_DMASYNC_PREWRITE;
++		op = BUS_DMASYNC_PREWRITE | BUS_DMASYNC_PREREAD;
+ 		break;
+ 	case DMA_TO_DEVICE:
+-		op = BUS_DMASYNC_PREREAD;
++		op = BUS_DMASYNC_PREWRITE;
+ 		break;
+ 	case DMA_FROM_DEVICE:
+-		op = BUS_DMASYNC_PREWRITE;
++		op = BUS_DMASYNC_PREREAD;
+ 		break;
+ 	default:
+ 		return;
